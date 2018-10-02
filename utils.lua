@@ -10,7 +10,6 @@ function NetworkTraining.appendNum2Storage(s,n)
   return s2
 end
 
-
 function NetworkTraining.class2color(ci,map)
 --[[
   produce a colorful class map, from a class index tensor
@@ -56,32 +55,16 @@ function NetworkTraining.class2color(ci,map)
   return o
 end
 
-function NetworkTraining.jitterImgLbl(img,lbl,marginV,marginH)
-  if marginH==nil then marginH=marginV end
-  if marginV>0 or marginH>0 then
-    local vOff=math.floor(math.random()*marginV)
-    local hOff=math.floor(math.random()*marginH)
-    local h,w=img:size(2),img:size(3)
-    img=image.crop(img,hOff,vOff,w-marginH+hOff,h-marginV+vOff)
-    lbl=image.crop(lbl,hOff,vOff,w-marginH+hOff,h-marginV+vOff)
-  end
-  return img,lbl
-end
-
-function NetworkTraining.jitterImgLbl2(img,lbl,h,w)
-  errmsg=" requested height is "..h.." requested width is "..w..
-         " image height is "..img:size(2).." image width is "..img:size(3)
-  local hmarg=img:size(2)-h
-  local wmarg=img:size(3)-w
-  assert(hmarg>=0 and wmarg>=0,"requested oversize crop. "..errmsg)
-  local hoff=math.floor(math.random()*hmarg)
-  local woff=math.floor(math.random()*wmarg)
-  img=image.crop(img, woff,hoff, woff+w,hoff+h)
-  if lbl then lbl=image.crop(lbl, woff,hoff, woff+w,hoff+h) end
-  return img,lbl
-end
-
-function NetworkTraining.jitterImgLbl3(img,lbl,d,expand)
+function NetworkTraining.jitterImgLbl(img,lbl,d,expand)
+  --[[
+    a general jitter function
+    img - input tensor, its first dimension indexes the channels
+    lbl - label tensor, does not have the channel dimension
+    d   - requested crop size
+    expand - if set to true, the function can produce crops bigger than input
+          otherwise, it issues an error when the requested crop size
+          is larger than input size
+  --]]
   local sz=torch.LongTensor(img:size())
   sz=sz:double()
   local marg=sz:narrow(1,2,sz:size(1)-1)-d
@@ -135,8 +118,10 @@ function NetworkTraining.augmentIntensity(img,max_z)
   return img
 end
 
-
 function NetworkTraining.myCrop(img,inds)
+--[[
+  cropping with indexes that can exceed tensor size (including negative values)
+--]]
   local outsize={}
   local dstinds={}
   local srcinds={}
@@ -160,4 +145,68 @@ function NetworkTraining.myCrop(img,inds)
   local crop=img.new(torch.Tensor(outsize):long():storage()):zero()
   crop[dstinds]:copy(img[srcinds])
   return crop
+end
+
+function NetworkTraining.piecewiseForward(input,output,dim, s, m, net, inds2copy)
+  --[[
+    applies a network piece-wise to the input input
+    copies the result to tensor output
+    dim - splitting dimension. starts at dim goes until the last dimension
+    s - requested input size
+    m - margin width
+    net - network
+    inds2copy - the indexes for copying ... a table of tables. 
+                if dim>1 then inds2copy should be initialized with indexes
+                for the dimensions that are not being split;
+                there should be one table, typically empty, for each dimension
+                for example, for dim=3 I set inds2copy={[1]={},[2]={}}
+
+    dividing the input and output tensors along consecutive dimensions
+    is performed recursively
+    when the recursion terminates, the input is forward through the net
+  --]] 
+  -- recursion terminates
+  if dim>input:dim() then
+    local o=net:forward(input:cuda())
+    output:copy(o[inds2copy])
+    return output
+  end
+  local is=input:size(dim)
+  local si=1 --start index
+  local sm=0 --start margin size
+  local em=m -- end margin size
+  local ind=0
+  if is<=s then 
+  -- input is smaller than the requested patch size
+  -- create a larger tensor and paste input in its middle
+  -- this is potentially memory-consuming, but in practice inputs are low-dim
+  -- and this only happens for datasets with uneven input size
+  -- and typically for just for the depth dimension
+    local sz=input:size()
+    sz[dim]=s
+    local ninput=input.new(sz):zero()
+    local sd=s-is
+    local m1=math.floor(sd/2)
+    local m2=sd-m1
+    inds2copy[dim]={m1+1,m1+is}
+    ninput:narrow(dim,m1+1,is):copy(input)
+    return NetworkTraining.piecewiseForward(ninput,output,dim+1,s,m,net,inds2copy)
+  end
+  while true do
+    if si+s-1>=is then 
+    -- the patch covers the last part of input, get last tile 
+    -- the last tile is adjacent to input end
+      sm=si+s-1-is+sm
+      si=is-s+1
+      em=0
+      inds2copy[dim]={sm+1,s-em}
+      NetworkTraining.piecewiseForward(input:narrow(dim,si,s),output:narrow(dim,si+sm,s-sm-em),dim+1,s,m,net,inds2copy)
+      break
+    end
+    inds2copy[dim]={sm+1,s-em}
+    NetworkTraining.piecewiseForward(input:narrow(dim,si,s),output:narrow(dim,si+sm,s-sm-em),dim+1,s,m,net,inds2copy)
+    si=si+s-2*m
+    sm=m
+  end
+  return output
 end
